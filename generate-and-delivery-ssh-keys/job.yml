@@ -1,0 +1,69 @@
+- id: 608ba0a1-74dd-4475-a575-159a5d0b9bc6
+  project: Development
+  loglevel: INFO
+  multipleExecutions: true
+  sequence:
+    keepgoing: false
+    strategy: node-first
+    commands:
+    - exec: /opt/ops/bin/rundeck-generate-ssh-keys ${job.username} ${job.execid}
+      description: Generate a pair of SSH keys
+    - exec: /opt/ops/bin/rundeck-google-drive-upload ${job.username} ${job.execid}
+      description: Upload archive to Google Drive
+    - exec: /opt/ops/bin/rundeck-gitlab-deliver-ssh-keys ${job.username} ${job.execid}
+      description: Send public key to Gitlab
+    - exec: /opt/ops/bin/rundeck-cleanup-packaging ${job.username} ${job.execid}
+      description: Clean the packaging area for this job
+  description: generate an ssh key and drop it off in a secure location
+  name: generate-and-delivery-ssh-keys
+  uuid: 608ba0a1-74dd-4475-a575-159a5d0b9bc6
+  group: Adhoc/Gitlab
+  options:
+    archive_path:
+      enforced: true
+      description: temporary path for building archive
+      value: /var/lib/rundeck/tmp
+      values:
+      - /var/lib/rundeck/tmp
+    archive_preference:
+      enforced: true
+      description: They type of archive you prefer
+      value: zip
+      values:
+      - bz2
+      - tar
+      - tgz
+      - zip
+    google_drive_folder:
+      enforced: true
+      description: Destination folder in Google Drive
+      value: DELIVERY
+      values:
+      - DELIVERY
+    ssh_key_bit_size:
+      enforced: true
+      required: true
+      description: bit size of the key
+      value: '2048'
+      values:
+      - '2048'
+      - '4096'
+    ssh_key_passphrase:
+      required: true
+      description: a passphrase to protect your private key (minimum of 8 characters)
+      secure: true
+      valueExposed: true
+    ssh_pass_min_len:
+      enforced: true
+      description: The  minimum length the passphrase must be
+      value: '8'
+      values:
+      - '8'
+    upload_to_gitlab:
+      enforced: true
+      required: true
+      description: by selecting this your public ssh key will be uploaded the gitlab server
+      value: 'no'
+      values:
+      - 'no'
+      - 'yes'

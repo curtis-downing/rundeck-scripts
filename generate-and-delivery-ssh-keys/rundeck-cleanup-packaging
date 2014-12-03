@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# assuming the shipping theme
+# the job of this script is to clean up the shipping area after some delivery mechanism has completed
+# in reality it's just cleaning up temp space and crud from a set of directories 
+
+# the standard is some temporary path appended with the job_execid
+
+## runndeck job options (not sure if these can be passed via environment variables)
+## my current understanding is no, but if if I'm wrong it would be preferable to update the script(s)
+rundeck_username="${1}"
+rundeck_job_execid="${2}"
+
+packaging_area="${RD_OPTION_ARCHIVE_PATH}/${rundeck_job_execid}"
+
+printf "Cleaning up packaging area for delivery number: %s (Recipient: %s)\n" "${rundeck_username}" "${rundeck_job_execid}"
+rm -rf "${packaging_area}"

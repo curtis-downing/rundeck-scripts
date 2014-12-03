@@ -1,0 +1,83 @@
+#!/usr/bin/env ruby
+
+require 'yaml'
+require 'gitlab'
+require 'rest-client'
+
+gitlab_config = '/opt/ops/etc/gitlab.yml'
+config        = YAML.load(File.open(gitlab_config))
+
+# assume we will not be paging (note no logic below for it anyway)
+# this only works up to 100 ueser anyway.. paging will need to be implemented as we grow
+# if this gets used
+results_per_page = config['results_per_page'] || 100
+
+gitlab_config = {
+  'server'   => config['server'],
+  'token'    => config['token'],
+  'protocol' => config['protocol'],
+  'per_page' => results_per_page
+}
+
+def deliver_ssh_key(u,key_path,key_file,cfg)
+  ssh_key = File.read("#{key_path}/#{key_file}")
+  user_id = u.id
+
+  begin
+    RestClient.post(
+      "#{cfg['protocol']}://#{cfg['server']}/api/v3/users/#{user_id}/keys",
+      {
+        :id    => user_id,
+        :title => key_file,
+        :key   => ssh_key
+      }.to_json,
+      headers = {
+        :content_type   => :json,
+        :accept         => :json,
+        'PRIVATE-TOKEN' => cfg['token']
+      }
+    )
+  rescue
+    # need to check the result status and make a better decision
+    p "Something when wrong and we were to lazy to program it in on this iteration" 
+    exit 1
+  end
+  p "Your public SSH key has been delivered"
+  exit 0
+end
+
+def start_delivery(gitlab_cfg) 
+  # rundeck options
+  rundeck_username   = ARGV[0]
+  rundeck_job_execid = ARGV[1]
+
+  archive_path = "#{ENV['RD_OPTION_ARCHIVE_PATH']}/#{rundeck_job_execid}"
+  files_for_delivery = "#{rundeck_job_execid}_#{rundeck_username}.pub"
+
+  gitlab = Gitlab.client(
+    :endpoint      => "#{gitlab_cfg['protocol']}://#{gitlab_cfg['server']}/api/v3",
+    :private_token => gitlab_cfg['token'],
+    :per_page      => gitlab_cfg['per_page']
+  )
+
+  gitlab.users(:per_page => 100).each do |user,user_info|
+    if user.username == "#{rundeck_username}"
+      Dir.chdir("#{archive_path}")
+      p "Shipping your public key to Gitlab"
+      deliver_ssh_key(user,archive_path,files_for_delivery,gitlab_cfg)
+    end
+  end
+end
+
+# MAIN
+## it all starts here
+
+# we only do this if the user requests it
+# otherwise we'll assume they just wanted ssh keys for another purpose
+if "#{ENV['RD_OPTION_UPLOAD_TO_GITLAB']}" == 'yes'
+  start_delivery(gitlab_config)
+else
+  p "Upload key to Gitlab: NO"
+end
+
+exit 0

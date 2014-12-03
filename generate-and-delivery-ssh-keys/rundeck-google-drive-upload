@@ -1,0 +1,233 @@
+#!/usr/bin/env ruby
+
+# an attempt to make rundeck and google drive work together
+# this started out specific for SSH Keys but I have tried to rewrite it to be more generic and reusable.
+# the program expects a file by the format <username>_<job_execid>.<archive format> example: jdoe_135534.zip
+# I'm trying to use a shipping, delivery analogy for this script.  The archive is a package to deliver to the 
+# destination, in this case the destination is google drive.
+
+# what this does
+# 1) collects the email via ldap query of the user running the script (assuming auth via ldap/ad)
+# 2) creates the necessary folder structure in the users Google Drive (assumes you have a service user set up for this)
+# 3) delivers the requested file(s) to the users google drive
+
+require 'google/api_client'
+require 'yaml'
+require 'ldap'
+
+google_config = YAML.load(File.open("/opt/ops/etc/google.yml"))
+ldap_config   = YAML.load(File.open("/opt/ops/etc/ldap.yml"))
+
+## Email of the Service Account #
+SERVICE_ACCOUNT_EMAIL = google_config['automation']['service_email'] 
+
+## Path to the Service Account's Private Key file #
+SERVICE_ACCOUNT_PKCS12_FILE_PATH = google_config['automation']['service_keyfile']
+
+# rundeck options
+rundeck_username   = ARGV[0]
+rundeck_job_execid = ARGV[1]
+
+# google options
+google_drive_folder = ENV['RD_OPTION_GOOGLE_DRIVE_FOLDER']
+
+# archive options (note .. not everything is an archive consider changing to a delivery shipping system naming convention) - docking bay or something
+archive_path       = "#{ENV['RD_OPTION_ARCHIVE_PATH']}/#{rundeck_job_execid}"
+archive_preference = "#{ENV['RD_OPTION_ARCHIVE_PREFERENCE']}"
+
+# make sure rundeck user and job execution id
+#rundeck_username = ARGV[0] || nil
+if rundeck_username.nil?
+  p "no username was passed to the script: exiting!"
+  exit 2
+end
+
+#rundeck_job_execid = ARGV[1] || nil
+if rundeck_job_execid.nil?
+  p "no job ID was passed to the script: exiting!"
+  exit 2
+end
+
+# I really with rundeck exposed the email address since it does ldap auth already
+# but as it is... it does not so this function is to query it out by the logged in username
+def get_email_by_user(ldap_cfg,rundeck_username)
+  host      = ldap_cfg['DEFAULT']['host']
+  port      = LDAP::LDAP_PORT
+  sslport   = LDAP::LDAPS_PORT
+  scope     = LDAP::LDAP_SCOPE_SUBTREE
+  base      = ldap_cfg['DEFAULT']['base']
+  filter    = "(&(objectCategory=person)(objectClass=user)(sAMAccountName=#{rundeck_username}))"
+  bind_user = ldap_cfg['DEFAULT']['bind']['user']
+  bind_pass = ldap_cfg['DEFAULT']['bind']['pass']
+  current_users_email = String.new
+
+  conn = LDAP::Conn.new(host, port)
+  conn.bind(bind_user, bind_pass)
+ 
+  conn.perror("bind")
+  begin
+    conn.search(base, scope, filter) { |entry|
+      current_users_email = entry['mail'][0].downcase.to_s
+    }
+  rescue LDAP::ResultError
+   conn.perror("search")
+    exit
+  end
+  conn.perror("search")
+  conn.unbind
+
+  current_users_email
+end
+
+class GoogleDriveUpload
+  def initialize(options={})
+    @service_account_email = options.fetch(:service_email)
+    @servic_account_pkcs12_file_path = options.fetch(:pkcs12_file_path)
+    @recipient_email_address = options.fetch(:recipient_email)
+    self.build_client(@recipient_email_address)
+    self.drive
+    self.about
+  end
+
+  def drive
+    @drive = @client.discovered_api('drive', 'v2')
+  end
+
+  def build_client(user_email)
+    key = Google::APIClient::PKCS12.load_key(@servic_account_pkcs12_file_path, 'notasecret')
+    asserter = Google::APIClient::JWTAsserter.new(@service_account_email,
+      'https://www.googleapis.com/auth/drive', key)
+    @client = Google::APIClient.new(
+      :application_name => 'Rundeck',
+      :application_version => '0.0.1'
+    )
+    @client.authorization = asserter.authorize(user_email)
+  end
+
+  def about 
+    result = @client.execute(:api_method => @drive.about.get)
+    if result.status == 200
+      @about = result.data
+    else
+      puts "An error occurred: #{result.data['error']['message']}"
+      exit 2
+    end
+  end
+
+  def file_exists(title,mime_type='application/vnd.google-apps.folder')
+    # bad function name...maybe!?
+    result = @client.execute(
+      :api_method => @drive.children.list,
+      :parameters => {
+        'folderId' => @about.root_folder_id,
+        'q' => "title = '#{title}' and mimeType = '#{mime_type}'"
+      }
+    )
+
+    return false if result.data.items.empty?
+    result
+  end
+
+  def response_successful(r)
+    if r.status == 200
+      printf "Delivered file: %s (MIME: %s)\n", r.data.title, r.data.mimeType
+    else
+      printf "An error occurred while delivering %s: %s\n", r.data.title, "#{r.data['error']['message']}"
+      exit 2
+    end
+  end
+
+  def create_file(options={})
+   # I consider this function too long - simplify!
+   file_name   = options.fetch('file_name')
+   title       = (options.has_key?('title')) ? (options.fetch('title')) : (file_name)
+   mime_type   = options.fetch('mime_type')
+   description = (options.has_key?('description')) ? (options.fetch('description')) : (nil)
+   parent      = (options.has_key?('parent')) ? (options.fetch('parent')) : (nil)
+
+    if ! file_exists(file_name,mime_type)
+      file = drive.files.insert.request_schema.new({
+        'title'       => title,
+        'parents'     => [{:id => @about.root_folder_id}],
+        'mimeType'    => mime_type,
+        'description' => description
+      })
+      
+      case mime_type
+        when 'application/vnd.google-apps.folder'
+          result = @client.execute(
+            :api_method => @drive.files.insert,
+            :body_object => file,
+          )
+          response_successful(result)
+        else
+          file = drive.files.insert.request_schema.new({
+            'title' => title,
+            'description' => description,
+            'mimeType' => mime_type
+          })
+
+          if parent
+            p = file_exists(parent)
+            file.parents = [{'id' => p.data.items[0]['id']}]
+          end
+
+          media = Google::APIClient::UploadIO.new(file_name,mime_type)
+
+          result = @client.execute(
+            :api_method => @drive.files.insert,
+            :body_object => file,
+            :media => media,
+            :parameters => {
+              'uploadType' => 'multipart',
+              'alt' => 'json'
+            }
+          )
+          response_successful(result)
+      end
+    end
+  end
+
+end
+
+# MAIN
+## pickup and delver the package 
+
+user_email_address = get_email_by_user(ldap_config,rundeck_username)
+files_for_delivery = "#{rundeck_job_execid}_#{rundeck_username}.#{archive_preference}"
+
+# terms for this can be made better but for now assuming everything is an archive
+# of the same format (packaging.. maybe add in delivery boxes.. I mean directories)
+case archive_preference
+when 'zip'
+  mime_type = "application/#{archive_preference}"
+else
+  mime_type = "application/x-tar"
+end
+
+g = GoogleDriveUpload.new({
+  :service_email => SERVICE_ACCOUNT_EMAIL,
+  :pkcs12_file_path => SERVICE_ACCOUNT_PKCS12_FILE_PATH,
+  :recipient_email => user_email_address
+})
+
+puts "Shipping files to Google Drive (#{user_email_address})"
+
+# create a folder for delivery purposes
+g.create_file({
+  'title'     => google_drive_folder,
+  'file_name' => google_drive_folder,
+  'mime_type' => 'application/vnd.google-apps.folder'
+})
+
+Dir.chdir(archive_path)
+# drop the file into the SSH folder
+g.create_file({
+  'title'       => files_for_delivery,
+  'file_name'   => files_for_delivery,
+  'mime_type'   => mime_type,
+  'description' => 'Rundeck Delivery',
+  'parent'      => google_drive_folder
+})
+
+printf "\nYour file(s) have been delivered to the folder '%s' at the root of your Google Drive\n\n", "#{google_drive_folder}"

@@ -1,0 +1,98 @@
+#!/bin/bash
+
+# the purpose of this program is to generate a pair of SSH keys via rundeck
+# and compress them in the archive format the user requests so a delivery program can pick them up later
+
+## ssh options
+ssh_key_bit_size=${RD_OPTION_SSH_KEY_BIT_SIZE}
+ssh_key_passphrase=${RD_OPTION_SSH_KEY_PASSPHRASE}
+ssh_key_passphrase_min_length=${RD_OPTION_SSH_PASS_MIN_LEN}
+
+## runndeck job options (not sure if these can be passed via environment variables)
+## my current understanding is no, but if if I'm wrong it would be preferable to update the script(s)
+rundeck_username="${1}"
+rundeck_job_execid="${2}"
+
+# global variables
+## archive options
+archive_path="${RD_OPTION_ARCHIVE_PATH}/${rundeck_job_execid}"
+archive_preference="${RD_OPTION_ARCHIVE_PREFERENCE}"
+
+## ldap options (requires python module shyaml)
+## this is probably a little more static than it should be.. but the standard has not caught on yet so... meh
+ldap_host=$(cat /opt/ops/etc/ldap.yml | shyaml get-value DEFAULT.host)
+ldap_base=$(cat /opt/ops/etc/ldap.yml | shyaml get-value DEFAULT.base)
+ldap_bind_user=$(cat /opt/ops/etc/ldap.yml | shyaml get-value DEFAULT.bind.user)
+ldap_bind_pass=$(cat /opt/ops/etc/ldap.yml | shyaml get-value DEFAULT.bind.pass)
+
+## email address
+## query for email of the user running the command via ldap (rundeck wth, why don't you just present the email address) 
+email_query_cmd="ldapsearch -h '${ldap_host}' -x -LLL -w '${ldap_bind_pass}' -D '${ldap_bind_user}' -b '${ldap_base}' '(&(objectCategory=person)(objectClass=user)(sAMAccountName=${rundeck_username}))' | awk '/mail\:/ {print \$2}' | tr [[:upper:]] [[:lower:]]"
+rundeck_user_email=$(eval $email_query_cmd)
+
+## preset ssh key filename and comment
+ssh_key_filename="${rundeck_job_execid}_${rundeck_username}"
+ssh_key_comment="${rundeck_user_email} (${rundeck_username}) [Created by Rundeck job execute id "${rundeck_job_execid}]
+
+# MAIN
+## let the work begin
+
+# ensure passphrase meets requirements 
+## it might be good to enforce password policy here as well as length
+## also might be good to make this a rundeck job option for so it can be managed outside the script
+if [ ${#ssh_key_passphrase} -lt ${ssh_key_passphrase_min_length} ]; then
+  echo 'You must use a passphrase that is at least ${ssh_key_passphrase_min_length} characters long'
+  exit 1
+fi
+
+if [ ! -d "${archive_path}" ]; then
+  mkdir -p "${archive_path}"
+  chmod 770 "${archive_path}"
+fi
+
+# generate the key 
+printf "Generating SSH keys for user: %s (%s)\n" "${rundeck_username}" "${rundeck_user_email}"
+eval "/usr/bin/ssh-keygen -t rsa -C '${ssh_key_comment}' -b ${ssh_key_bit_size} -f '${archive_path}/${ssh_key_filename}' -N '${ssh_key_passphrase}'" &> /dev/null
+
+# put some standard protections around the keys
+chmod 600 "${archive_path}/${ssh_key_filename}"
+chmod 600 "${archive_path}/${ssh_key_filename}.pub"
+
+# fail if the key generation fails
+if [ $? -eq 0 ]; then
+  echo 'Success!'
+  echo 'Keep your private key secured and remember passphrase.'
+else
+  echo 'There was a problem generating your SSH keys'
+  exit 1
+fi
+
+# archive the keys up as prepartion for shipping via a delivery script
+cd ${archive_path}
+echo "Your SSH keys are being packaged into a ${archive_preference} archive and prepared for shipping."
+case "${archive_preference}" in
+  zip)
+    eval "zip ${ssh_key_filename}.zip ${ssh_key_filename} ${ssh_key_filename}.pub"
+    chmod 600 "${ssh_key_filename}.zip"
+    ;; 
+  tar)
+    eval "tar -cvf ${ssh_key_filename}.tar ${ssh_key_filename} ${ssh_key_filename}.pub"
+    chmod 600 "${ssh_key_filename}.tar"
+    ;; 
+  tgz)
+    eval "tar -cvzf ${ssh_key_filename}.tgz ${ssh_key_filename} ${ssh_key_filename}.pub"
+    chmod 600 "${ssh_key_filename}.tgz"
+    ;; 
+  bz2)
+    eval "tar -cvjf ${ssh_key_filename}.bz2 ${ssh_key_filename} ${ssh_key_filename}.pub"
+    chmod 600 "${ssh_key_filename}.bz2"
+    ;; 
+  *)
+    echo 'You have selected an invalid archive format.  Thank you, I must now self terminate!'
+    echo '* sound of gun hammer clicks *'
+    echo 'BANG!'
+    exit 2 
+    ;;
+esac
+
+exit 0
